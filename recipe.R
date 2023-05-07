@@ -98,7 +98,7 @@ plot_scenario <- function(p, hypothesis, alternative, hyp_coalitions, alt_coalit
   ggplot(plot_data, aes(x=p, fill=coalition, color=coalition)) +
     ggtitle(title) +  
     geom_histogram(alpha=0.5, position="identity") +
-    annotate("text", label=annotation, x = 4, y = 400)  
+    annotate("text", label=annotation, x = 3.5, y = 200)  
   
   ggsave(fname)
 }
@@ -166,7 +166,7 @@ demo.31 <- function(){
 }
 
 demo.32 <- function(){
-  # Build a shap-like object - a bit hacky but I want to finish this article
+  # Monkey-patch a shapr-like object
   dt_asymmetric <- explanation
   dt_asymmetric[, none := p]
 
@@ -240,33 +240,10 @@ explanation_symmetric <- explain(
 test_id <- 100
 
 # Scenarios
-explainer_symmetric$feature_labels <- x_var
-
-# Add gaussian items (covariance matrix, expectation)
-explainer_symmetric <- gaussian_inputs(explanation_symmetric$x_test, explainer_symmetric, p)
-
-combination_table <- prepare_data_gaussian(explainer_symmetric)
-
-cnms <- colnames(explainer_symmetric$x_test)
-data.table::setkeyv(combination_table, c("id", "id_combination"))
-
-combination_table[, p_hat := predict_model(explainer_symmetric$model, newdata = .SD), .SDcols = cnms]
-
-combination_table[id_combination == 1, p_hat := p]
-
-p_all <- predict_model(explainer_symmetric$model, newdata = explainer_symmetric$x_test)
-combination_table[id_combination == max(id_combination), p_hat := p_all[id]]
-
-dt_res <- combination_table[, .(k = sum((p_hat * w) / sum(w))), .(id, id_combination)]
-data.table::setkeyv(dt_res, c("id", "id_combination"))
-
-dt_mat <- data.table::dcast(dt_res, id_combination ~ id, value.var = "k")
-dt_mat[, id_combination := NULL]
-
-kshap <-  t(explainer_symmetric$W %*% as.matrix(dt_mat))
-dt_kshap <- data.table::as.data.table(kshap)
-
-colnames(dt_kshap) <- c("none", cnms)
+internals <- shapr_internals(x_var, explainer_symmetric)
+combination_table <- internals$combination_table
+dt_res <- internals$dt_res
+explainer_symmetric <- internals$explainer
 
 # Get distributions
 p.all <- combination_table[(id==test_id)&(id_combination==8), p_hat]

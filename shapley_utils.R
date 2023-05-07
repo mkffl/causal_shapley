@@ -5,69 +5,6 @@ library(shapr)
 library(ggplot2)
 library(ggbeeswarm)
 
-# index_given: feature combination, determined by partial order
-# Return list of size nrows(index_given)
-sample_gaussian <- function(index_given, n_samples, mu, cov_mat, m, x_test) {
-
-  # Check input
-  stopifnot(is.matrix(x_test))
-
-  # Handles the unconditional and full conditional separately when predicting
-  cnms <- colnames(x_test)
-  if (length(index_given) %in% c(0, m)) return(data.table::as.data.table(x_test))
-
-  dependent_ind <- (1:length(mu))[-index_given]
-  x_test_gaussian <- x_test[index_given]
-  tmp <- condMVNorm::condMVN(
-    mean = mu,
-    sigma = cov_mat,
-    dependent.ind = dependent_ind,
-    given.ind = index_given,
-    X.given = x_test_gaussian
-  )
-
-  # Makes the conditional covariance matrix symmetric in the rare case where numerical instability made it unsymmetric
-  if (!isSymmetric(tmp[["condVar"]])) {
-    tmp[["condVar"]] <- Matrix::symmpart(tmp$condVar)
-  }
-
-  ret0 <- mvnfast::rmvn(n = n_samples, mu = tmp$condMean, sigma = tmp$condVar)
-
-  ret <- matrix(NA, ncol = m, nrow = n_samples)
-  ret[, index_given] <- rep(x_test_gaussian, each = n_samples)
-  ret[, dependent_ind] <- ret0
-
-  colnames(ret) <- cnms
-  return(as.data.table(ret))
-}
-
-respects_order <- function(index_given, ordering) {
-  
-  for (i in index_given) {
-    
-    idx_position <- Position(function(x) i %in% x, ordering, nomatch = 0)
-    
-    stopifnot(idx_position > 0) # It should always be in the ordering
-    
-    # check for precedents (only relevant if not root set)
-    if (idx_position > 1) {
-      
-      # get precedents
-      precedents <- unlist(ordering[1:(idx_position-1)])
-      # all precedents must be in index
-      # print(precedents)
-      # print(intersect(precedents, index))
-      # print(setequal(precedents, intersect(precedents, index)))
-      if (!setequal(precedents, intersect(precedents, index_given))) {
-        # print("here")
-        return (FALSE)
-      }
-    }
-  }
-  
-  TRUE
-}
-
 explainer_x_test <- function(x_test, feature_labels) {
 
   # Remove variables that were not used for training
@@ -96,112 +33,43 @@ gaussian_inputs <- function(x_test, explainer, prediction_zero, approach = "gaus
     return(explainer)
 }
 
-# Second step of gaussian-based explanation
-# Return sample data for every combination                      
-prepare_data_gaussian <- function(explainer, seed = 1, n_samples = 1e3, index_features = NULL, asymmetric = FALSE, ordering = NULL) {
+# Expose shapr's intermediate inputs
+# combination_table: gaussian samples for each coalition+test_id
+# dt_res: averages the samples to return one estimate by coalition+test_id
+# dt_mat: payoff vector used in phi = (Zt*W*Z)Zt*W*dt_mat 
+#         see section 3.2 in https://arxiv.org/pdf/1903.10464.pdf
+# dt_kshap: the Shapley values for every test_id
+shapr_internals <- function(x_var, explainer){
+  # Add gaussian items (covariance matrix, expectation)
+  explainer$feature_labels <- x_var
+  explainer <- gaussian_inputs(explanation_symmetric$x_test, explainer, p)
 
-  id <- id_combination <- w <- NULL # due to NSE notes in R CMD check
+  combination_table <- shapr:::prepare_data.gaussian(explainer)
 
-  n_xtest <- nrow(explainer$x_test)
-
-  dt_l <- list()
-  if (!is.null(seed)) set.seed(seed)
-  if (is.null(index_features)) {
-    features <- explainer$X$features
-  } else {
-    features <- explainer$X$features[index_features]
-  }
-
-  if (asymmetric == TRUE) {
-
-    message("Asymmetric flag enabled. Only using permutations consistent with the ordering.")
-
-    # By default, no ordering in specified, meaning all variables are in one component.
-    if (is.null(ordering)) {
-      message("Using no ordering by default.")
-      ordering <- list(1:ncol(x$x_test))
-    }
-
-    # Filter out the features that do not agree with the order
-    features <- features[sapply(features, respects_order, ordering = ordering)]
-  }
-
-  for (i in seq(n_xtest)) {
-    l <- lapply(
-      X = features,
-      FUN = sample_gaussian,
-      n_samples = n_samples,
-      mu = explainer$mu,
-      cov_mat = explainer$cov_mat,
-      m = ncol(explainer$x_test),
-      x_test = explainer$x_test[i, , drop = FALSE]
-    )
-
-    dt_l[[i]] <- data.table::rbindlist(l, idcol = "id_combination")
-    dt_l[[i]][, w := 1 / n_samples]
-    dt_l[[i]][, id := i]
-    if (!is.null(index_features)) dt_l[[i]][, id_combination := index_features[id_combination]]
-  }
-  combination_table <- data.table::rbindlist(dt_l, use.names = TRUE, fill = TRUE)
-  combination_table[id_combination %in% c(1, 2^ncol(explainer$x_test)), w := 1.0]
-  return(combination_table)
-}
-                             
-# Third step of explanation
-prediction <- function(dt, prediction_zero, explainer) {
-
-  # Checks on input data
-  id <- w <- id_combination <- p_hat <- NULL # due to NSE notes in R CMD check
-  stopifnot(
-    data.table::is.data.table(dt),
-    !is.null(dt[["id"]]),
-    !is.null(dt[["id_combination"]]),
-    !is.null(dt[["w"]])
-  )
-
-  # Setup
   cnms <- colnames(explainer$x_test)
-  data.table::setkeyv(dt, c("id", "id_combination"))
+  data.table::setkeyv(combination_table, c("id", "id_combination"))
 
-  # Check that the number of test observations equals max(id)
-  stopifnot(nrow(explainer$x_test) == dt[, max(id)])
+  combination_table[, p_hat := predict_model(explainer$model, newdata = .SD), .SDcols = cnms]
 
-  # Predictions
-  dt[, p_hat := predict_model(explainer$model, newdata = .SD), .SDcols = cnms]
-  dt[id_combination == 1, p_hat := prediction_zero]
+  combination_table[id_combination == 1, p_hat := p]
+
   p_all <- predict_model(explainer$model, newdata = explainer$x_test)
-  dt[id_combination == max(id_combination), p_hat := p_all[id]]
+  combination_table[id_combination == max(id_combination), p_hat := p_all[id]]
 
-  # Calculate contributions
-  dt_res <- dt[, .(k = sum((p_hat * w) / sum(w))), .(id, id_combination)]
+  dt_res <- combination_table[, .(k = sum((p_hat * w) / sum(w))), .(id, id_combination)]
   data.table::setkeyv(dt_res, c("id", "id_combination"))
+
   dt_mat <- data.table::dcast(dt_res, id_combination ~ id, value.var = "k")
   dt_mat[, id_combination := NULL]
+
   kshap <-  t(explainer$W %*% as.matrix(dt_mat))
   dt_kshap <- data.table::as.data.table(kshap)
   colnames(dt_kshap) <- c("none", cnms)
 
-  r <- list(dt = dt_kshap, model = explainer$model, p = p_all, x_test = explainer$x_test)
-  attr(r, "class") <- c("shapr", "list")
-
-  return(r)
+  return(list(explainer=explainer, combination_table=combination_table, dt_res=dt_res, dt_kshap=dt_kshap))
 }
-
-make_ordering <- function(ordering, column_names){
-  ordering <- read.table(
-    text=gsub("(?<=[a-z])\\s+", "\n", ordering, perl=TRUE), 
-    header=FALSE,
-    col.names = c("income", "race", "zip")
-  )
-  ordering <- as.data.table(ordering)
-  colnames(ordering) <- column_names
-  ordering[, ordering_id := 1:nrow(ordering)]
-  return(ordering)
-}
-
 
 tag_coalitions <- function(ordering, var_i){
-  #TODO: use something like for (col in paste0("V", 20:100))dt[ , (col) := sqrt(dt[[col]])]
   ordering[, incl.income := as.integer(income <= get(var_i))]
   ordering[, incl.race := as.integer(race <= get(var_i))]
   ordering[, incl.zip := as.integer(zip <= get(var_i))]
